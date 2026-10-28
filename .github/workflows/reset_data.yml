@@ -20,11 +20,11 @@ on:
 permissions:
   contents: write
 
-# Reset is destructive — must not overlap with check/single_run (whose
-# additive merge would re-insert deleted rows).
+# Every workflow that writes the data branch must use this same group.
 concurrency:
-  group: db-reset
+  group: icourse-data-writer
   cancel-in-progress: false
+  queue: max
 
 jobs:
   reset:
@@ -42,7 +42,7 @@ jobs:
       - name: Fetch database from data branch
         run: |
           mkdir -p data
-          git fetch origin data --depth=1
+          bash scripts/data_branch.sh fetch
           if git cat-file -e origin/data:data/icourse-index.enc 2>/dev/null; then
             mkdir -p data/sharded/shards
             git show origin/data:data/icourse-index.enc > data/sharded/icourse-index.enc
@@ -133,4 +133,4 @@ jobs:
           git add data/
           git commit -q -m "chore: reset course data (course_id=${{ inputs.course_id }})"
           git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
-          git push --force origin data
+          bash "$GITHUB_WORKSPACE/scripts/data_branch.sh" push

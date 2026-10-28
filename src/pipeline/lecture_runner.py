@@ -112,7 +112,8 @@ class LectureRunner:
 
         # ── Phase E — drain remaining OCR work ─────────────────────────
         ppt_stats = ppt_handle.drain()
-        _ = ppt_stats  # stats are emitted by PPTAsyncHandle.drain via reporter
+        if ppt_stats.failed:
+            self._reporter.record_failure("PPT download/OCR", sub_id)
 
         # ── Phase E2 — kick off next lecture's OCR (runs during LLM) ───
         # Images were prefetched in Phase C; switch to OCR phase by
@@ -203,7 +204,7 @@ class LectureRunner:
         except TimeoutError as e:
             self._reporter.info(f"    [SKIP] {e}")
             self._db.update_error(sub_id, "transcribe", str(e))
-            return None, None
+            raise
         if handle is None:
             # AudioDownloader returns None when get_video_url() returned
             # None — i.e. the lecture has no playable video.
@@ -227,6 +228,7 @@ class LectureRunner:
             # ever raises this we save whatever we got so the next run can
             # decide whether to retry.
             self._reporter.info(f"    [WARN] Incomplete audio: {e}")
+            self._reporter.record_failure("incomplete audio", sub_id)
             transcript = self._transcriber._last_transcript
             segments = self._transcriber._last_segments
         except Exception as e:
@@ -312,8 +314,11 @@ def resummarize_old_lectures(client: "ICourseClient", db: "Database",
             if check_session_fn:
                 check_session_fn(client)
             try:
-                ppt_pipeline.run_blocking(client, course_id, sub_id)
+                ppt_stats = ppt_pipeline.run_blocking(client, course_id, sub_id)
+                if ppt_stats.failed:
+                    reporter.record_failure("resummarize PPT download/OCR", sub_id)
             except Exception as e:
+                reporter.record_failure("resummarize PPT OCR", sub_id)
                 reporter.info(
                     f"    [WARN] PPT OCR phase failed: "
                     f"{type(e).__name__}: {e}"
@@ -321,6 +326,7 @@ def resummarize_old_lectures(client: "ICourseClient", db: "Database",
 
             transcript = row.get("transcript") or ""
             if not transcript.strip():
+                reporter.record_failure("resummarize transcript", sub_id)
                 reporter.info("    Empty transcript, cannot resummarize.")
                 continue
 
@@ -353,5 +359,6 @@ def resummarize_old_lectures(client: "ICourseClient", db: "Database",
             })
             seen_sub_ids.add(sub_id)
         except Exception:
+            reporter.record_failure("resummarize lecture", sub_id)
             reporter.info(f"    [FAIL] Resummarize {sub_id}:")
             traceback.print_exc()
