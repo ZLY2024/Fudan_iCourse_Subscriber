@@ -6,6 +6,12 @@ on:
 permissions:
   contents: write
 
+# Every workflow that writes the data branch must use this same group.
+concurrency:
+  group: icourse-data-writer
+  cancel-in-progress: false
+  queue: max
+
 jobs:
   reshard:
     runs-on: ubuntu-latest
@@ -24,7 +30,7 @@ jobs:
       - name: Fetch encrypted database from data branch
         run: |
           mkdir -p data
-          git fetch origin data --depth=1 2>/dev/null || echo "No data branch yet."
+          bash scripts/data_branch.sh fetch
           if ! git rev-parse origin/data >/dev/null 2>&1; then
             echo "No data branch, nothing to re-shard."
             exit 0
@@ -85,4 +91,4 @@ jobs:
           git add data/
           git commit -q -m "chore: re-shard database (activity-aware grouping)"
           git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
-          git push --force origin data
+          bash "$GITHUB_WORKSPACE/scripts/data_branch.sh" push

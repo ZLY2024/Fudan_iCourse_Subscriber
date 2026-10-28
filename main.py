@@ -131,6 +131,7 @@ def _enumerate_lectures(client: ICourseClient, db: Database,
                 )
                 out.append((course_id, course_title, lecture))
         except Exception:
+            reporter.record_failure("course enumeration", course_id)
             reporter.course_enumeration_error(course_id)
             traceback.print_exc()
     return out
@@ -164,8 +165,8 @@ def _drive_lectures(client: ICourseClient, db: Database,
             next_course, _, next_lec = all_lectures[i + 1]
             next_info = (next_course, str(next_lec["sub_id"]))
 
-        _check_session(client)
         try:
+            _check_session(client)
             summary = runner.run(
                 course_id, course_title, lecture, next_info=next_info,
             )
@@ -178,6 +179,7 @@ def _drive_lectures(client: ICourseClient, db: Database,
                     "summary": summary,
                 })
         except Exception:
+            reporter.record_failure("lecture processing", sub_id)
             reporter.lecture_error(sub_id)
             traceback.print_exc()
         finally:
@@ -212,8 +214,10 @@ def _send_email(emailer: Emailer | None, db: Database, reporter: Reporter,
         if emailer.send(email_items):
             db.mark_emailed_batch([item["sub_id"] for item in email_items])
         else:
+            reporter.record_failure("email delivery")
             reporter.email_failed()
     except Exception:
+        reporter.record_failure("email delivery")
         reporter.info("[Email] Failed to send:")
         traceback.print_exc()
 
@@ -231,10 +235,12 @@ def _crawl_semester_catalog(client: ICourseClient, db: Database,
         _check_session(client)
         terms = client.discover_terms()
     except Exception as e:
+        reporter.record_failure("catalog discovery")
         reporter.crawl_courses_failed("discovery", e)
         return
 
     if not terms:
+        reporter.record_failure("catalog discovery", "no semesters returned")
         reporter.info("No semesters found via API discovery.")
         return
 
@@ -260,7 +266,9 @@ def _crawl_semester_catalog(client: ICourseClient, db: Database,
                 name, len(rows), deleted, upserted, time.time() - t0,
             )
         except Exception as e:
+            reporter.record_failure("catalog crawl", code)
             reporter.crawl_courses_failed(name, e)
+            continue
         reporter.info(f"  ({code}) → {expected} API courses, "
                       f"{len(rows)} fetched")
 
@@ -302,6 +310,7 @@ def run():
     if not config.COURSE_IDS:
         # Crawl-only mode: nothing to process, just persist + exit.
         reporter.info("\n[Crawl-only mode] No COURSE_IDS — skipping lectures.")
+        reporter.raise_if_failed()
         reporter.run_footer()
         return
 
@@ -328,6 +337,7 @@ def run():
                     check_session_fn=_check_session,
                 )
             except Exception:
+                reporter.record_failure("resummarize phase")
                 reporter.info("[Resummarize] phase errored:")
                 traceback.print_exc()
         else:
@@ -338,6 +348,7 @@ def run():
         scheduler.shutdown()
 
     _send_email(emailer, db, reporter, email_items)
+    reporter.raise_if_failed()
     reporter.run_footer()
 
 

@@ -67,6 +67,7 @@ class Reporter:
 
     def __init__(self):
         self._lock = threading.Lock()
+        self._failures: list[str] = []
         # sub_id -> (last_done_emitted_at_count, t0, last_print_t)
         self._image_progress_state: dict[str, dict] = {}
         self._ocr_progress_state: dict[str, dict] = {}
@@ -84,6 +85,24 @@ class Reporter:
         with self._lock:
             print(f"\n{'=' * 60}")
             print("Run complete.", flush=True)
+
+    def record_failure(self, stage: str, item: str = "") -> None:
+        """Remember a failure while allowing other work to finish."""
+        with self._lock:
+            self._failures.append(f"{stage}: {item}" if item else stage)
+
+    def raise_if_failed(self) -> None:
+        """Fail the process only after progress and email have been saved.
+
+        Keep credentials / exception messages out of the final summary;
+        detailed tracebacks have already been logged at the failure site.
+        """
+        with self._lock:
+            failures = list(self._failures)
+        if failures:
+            summary = f"Run failed with {len(failures)} error(s): " + "; ".join(failures)
+            print(summary, flush=True)
+            raise RuntimeError(summary)
 
     # ── Course-level ─────────────────────────────────────────────────────
 
