@@ -7,14 +7,12 @@ AudioDownloader.  This file does only orchestration:
   1. Build all components.
   2. Login + enumerate.
   3. Drive LectureRunner across the queued lectures.
-  4. Resummarize old (pre-v2) lectures.
-  5. Email + bookkeeping.
-  6. Shutdown.
+  4. Email + bookkeeping.
+  5. Shutdown.
 
 Anything more interesting belongs in one of ``src/*`` modules.
 """
 
-import datetime
 import time
 import traceback
 
@@ -22,8 +20,7 @@ from src.runtime import config
 from src.data.database import Database
 from src.api.emailer import Emailer
 from src.api.icourse import ICourseClient
-from src.pipeline.lecture_runner import LectureRunner, resummarize_old_lectures
-from src.pipeline.ppt_pipeline import PPTPipeline
+from src.pipeline.lecture_runner import LectureRunner
 from src.runtime.reporter import Reporter
 from src.runtime.scheduler import Scheduler
 from src.ai.summarizer import Summarizer
@@ -31,7 +28,7 @@ from src.ai.transcriber import Transcriber
 from src.api.webvpn import WebVPNSession
 
 
-def login_with_retry(max_attempts: int = 5) -> WebVPNSession:
+def login_with_retry(max_attempts: int = 10) -> WebVPNSession:
     """Login to WebVPN + iCourse CAS, retrying on transient failures.
 
     The iCourse CAS step (authenticate_icourse) has its own inner retry
@@ -92,16 +89,27 @@ def _enumerate_lectures(client: ICourseClient, db: Database,
 
             # School system sometimes lists duplicate lectures; dedup the
             # raw list so the same logic produces the same outcome each run.
-            seen_sub_titles: set[str] = set()
+            # When a sub_title appears more than once, keep the first one
+            # that has playback; if none have playback, keep the first.
+            seen_sub_titles: dict[str, dict] = {}
             deduped = []
             for lec in lectures:
                 title = lec.get("sub_title", "")
-                if title and title in seen_sub_titles:
-                    reporter.course_dedup_skip(title, lec["sub_id"])
+                if not title:
+                    deduped.append(lec)
                     continue
-                if title:
-                    seen_sub_titles.add(title)
-                deduped.append(lec)
+                existing = seen_sub_titles.get(title)
+                if existing is None:
+                    seen_sub_titles[title] = lec
+                    deduped.append(lec)
+                elif not existing.get("has_playback") and lec.get("has_playback"):
+                    # replace the earlier no-playback entry in place so the
+                    # processing order stays chronological
+                    deduped[deduped.index(existing)] = lec
+                    seen_sub_titles[title] = lec
+                    reporter.course_dedup_skip(title, existing["sub_id"])
+                else:
+                    reporter.course_dedup_skip(title, lec["sub_id"])
             lectures = deduped
 
             known_processed = db.get_processed_sub_ids(course_id)
@@ -150,12 +158,12 @@ def _drive_lectures(client: ICourseClient, db: Database,
     if not all_lectures:
         return
 
-    first_course, _, first_lec = all_lectures[0]
-    scheduler.prefetch_lecture(client, first_course, str(first_lec["sub_id"]))
-
     runner = LectureRunner(
         client, db, scheduler, transcriber, summarizer, reporter,
     )
+
+    first_course, _, first_lec = all_lectures[0]
+    runner.prefetch_first(first_course, str(first_lec["sub_id"]))
 
     for i, (course_id, course_title, lecture) in enumerate(all_lectures):
         sub_id = str(lecture["sub_id"])
@@ -220,11 +228,11 @@ def _send_email(emailer: Emailer | None, db: Database, reporter: Reporter,
 
 def _crawl_semester_catalog(client: ICourseClient, db: Database,
                             reporter: Reporter) -> None:
-    """Auto-discover every available semester and refresh ``all_courses``.
+    """Discover semesters on every run and fetch catalogs for new terms.
 
-    Walks every page of get-course-list for each discovered term and
-    replaces the term's catalog in one transaction.  No longer requires
-    the ``CRAWL_TERM`` secret — the API tells us what terms exist.
+    Compare API term names with the names stored in ``all_courses``.
+    Only terms with a successfully fetched catalog are considered known,
+    so empty or failed fetches are retried on the next run.
     """
     reporter.info("Discovering available semesters from API...")
     try:
@@ -241,7 +249,13 @@ def _crawl_semester_catalog(client: ICourseClient, db: Database,
     reporter.info(f"Found {len(terms)} semester(s): "
                   f"{', '.join(t['name'] for t in terms)}")
 
-    for term_info in terms:
+    known_terms = db.list_catalog_terms()
+    new_terms = [term for term in terms if term["name"] not in known_terms]
+    if not new_terms:
+        reporter.info("Skipping catalog crawl (no new semesters).")
+        return
+
+    for term_info in new_terms:
         code = term_info["code"]
         name = term_info["name"]
         expected = term_info["count"]
@@ -253,6 +267,12 @@ def _crawl_semester_catalog(client: ICourseClient, db: Database,
             if not rows:
                 reporter.info(f"  Term {name}: API returned 0 courses, skipping.")
                 continue
+            if len(rows) < expected:
+                reporter.info(
+                    f"  Term {name}: fetched {len(rows)} of {expected} courses, "
+                    "deferring catalog update until the next run."
+                )
+                continue
             # Pass the human-readable term name (not the API code) to the
             # DB so the frontend displays "2025-20262" instead of "25".
             deleted, upserted = db.upsert_all_courses_for_term(name, rows)
@@ -261,6 +281,7 @@ def _crawl_semester_catalog(client: ICourseClient, db: Database,
             )
         except Exception as e:
             reporter.crawl_courses_failed(name, e)
+            continue
         reporter.info(f"  ({code}) → {expected} API courses, "
                       f"{len(rows)} fetched")
 
@@ -280,6 +301,9 @@ def run():
         # Fall through — crawl-only mode is valid.
 
     db = Database()
+    corrected = db.sync_dates_from_sub()
+    if corrected:
+        print(f"  [Date] Synced {corrected} lecture date(s) from sub_title", flush=True)
     transcriber = Transcriber()
     summarizer = Summarizer() if config.COURSE_IDS else None
     emailer = Emailer() if (
@@ -290,14 +314,8 @@ def run():
     client = ICourseClient(vpn)
     email_items: list = []
 
-    # Refresh the semester catalog: run on the 5th and 25th of each month,
-    # or immediately if the database has no catalog data yet.
-    has_catalog = db.has_all_courses()
-    today = datetime.datetime.now().day
-    if not has_catalog or today in (5, 25):
-        _crawl_semester_catalog(client, db, reporter)
-    else:
-        reporter.info("Skipping catalog crawl (has data, not the 5th or 25th).")
+    # Discover new semesters every run; only fetch catalogs not yet stored.
+    _crawl_semester_catalog(client, db, reporter)
 
     if not config.COURSE_IDS:
         # Crawl-only mode: nothing to process, just persist + exit.
@@ -314,26 +332,6 @@ def run():
             all_lectures, email_items,
         )
 
-        # Resummarize old (pre-v2) lectures, scoped to the courses we're
-        # actively monitoring this run.  Opt-in via RESUMMARIZE_OLD=1
-        # because re-OCR + re-LLM on every stale lecture turns a 5-min
-        # nightly run into a 2-hour one; flip on for one-shot manual runs.
-        if config.RESUMMARIZE_OLD_ENABLED:
-            try:
-                _check_session(client)
-                ppt_pipeline = PPTPipeline(db, scheduler, reporter)
-                resummarize_old_lectures(
-                    client, db, summarizer, ppt_pipeline, reporter,
-                    email_items, config.COURSE_IDS,
-                    check_session_fn=_check_session,
-                )
-            except Exception:
-                reporter.info("[Resummarize] phase errored:")
-                traceback.print_exc()
-        else:
-            reporter.info(
-                "\n[Resummarize] Skipping — set RESUMMARIZE_OLD=1 to enable."
-            )
     finally:
         scheduler.shutdown()
 

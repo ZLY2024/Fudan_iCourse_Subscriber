@@ -28,8 +28,6 @@ CREATE TABLE IF NOT EXISTS lectures (
     processed_at TEXT, emailed_at TEXT,
     error_msg TEXT, error_count INTEGER DEFAULT 0,
     error_stage TEXT, summary_model TEXT,
-    summary_format_version INTEGER DEFAULT 0,
-    old_summary TEXT,
     FOREIGN KEY (course_id) REFERENCES courses(course_id)
 );
 CREATE TABLE IF NOT EXISTS ppt_pages (
@@ -78,12 +76,6 @@ LECTURES_MIGRATION_COLUMNS: list[tuple[str, str]] = [
     ("error_count", "INTEGER DEFAULT 0"),
     ("error_stage", "TEXT"),
     ("summary_model", "TEXT"),
-    ("summary_format_version", "INTEGER DEFAULT 0"),
-    # Holds the *previous* generation's summary when resummarize_old_lectures
-    # upgrades a row from v0/v1 to v2 (PPT-aware) — see Database.update_summary_v2
-    # for the COALESCE-based migration.  Lets the email + frontend show
-    # "old vs new" diffs without losing the original.
-    ("old_summary", "TEXT"),
 ]
 
 # Columns added to ``ppt_pages`` after its initial shape shipped.

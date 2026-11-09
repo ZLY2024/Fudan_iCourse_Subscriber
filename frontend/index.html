@@ -104,6 +104,10 @@
             class="text-sm bg-blue-500 text-white px-3 py-1.5 rounded-lg hover:bg-blue-600">
       导出
     </button>
+    <button x-show="view === 'lectures'" @click="openDeleteDialog()"
+            class="text-sm bg-white text-red-500 border border-red-300 px-3 py-1.5 rounded-lg hover:bg-red-50">
+      删除
+    </button>
     <!-- View toggle (detail view, desktop): cycle summary → transcript → PPT -->
     <button x-show="view === 'detail' && currentLecture"
             @click="cycleDetailView()"
@@ -273,7 +277,7 @@
             </div>
             <div class="flex flex-col items-end flex-shrink-0">
               <span class="text-xs font-medium bg-blue-50 text-blue-700 px-2 py-0.5 rounded-full"
-                    x-text="c.summary_count + '/' + c.total_count + ' summaries'"></span>
+                    x-text="c.summary_count + ' summaries'"></span>
               <span class="text-xs text-gray-400 mt-1" x-text="relTime(c.last_updated)"></span>
             </div>
           </div>
@@ -301,12 +305,15 @@
                   :class="{
                     'badge-ready': lec.state === 'ready',
                     'badge-processing': lec.state === 'processing',
-                    'badge-waiting': lec.state === 'waiting',
+                    'badge-waiting': lec.state === 'waiting' || lec.state === 'novideo',
+                    'badge-skipped': lec.state === 'skipped',
                     'badge-failed': lec.state === 'failed'
                   }"
                   x-text="lec.state === 'ready' ? 'Ready' :
                           lec.state === 'processing' ? 'Summarizing…' :
                           lec.state === 'waiting' ? 'Waiting' :
+                          lec.state === 'novideo' ? 'No Video' :
+                          lec.state === 'skipped' ? 'No Content' :
                           'Failed: ' + (lec.error_stage || 'unknown')"></span>
           </div>
           <!-- Preview snippet for ready lectures -->
@@ -381,7 +388,7 @@
         <!-- Prev / next lecture nav (foot of detail view).  Wraps within the
              current course's lecture list, in the same order the lectures
              page renders.  Hidden on the only/last/first lecture as
-             appropriate; respects sub_id ordering. -->
+             appropriate; respects chronological (sub_title) ordering. -->
         <nav class="mt-8 pt-4 border-t border-gray-100 flex items-stretch gap-2 text-sm">
           <button @click="gotoPrevLecture()"
                   :disabled="!prevLecture()"
@@ -411,13 +418,62 @@
 
   <!-- ─── SEARCH ─── -->
   <div x-show="view === 'search'" class="view-enter max-w-2xl mx-auto p-4">
-    <div class="relative mb-4">
-      <svg class="absolute left-3 top-2.5 w-4 h-4 text-gray-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-        <path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
-      </svg>
-      <input x-model="searchQuery" @input="doSearch()" type="text"
-             placeholder="Search summaries…" autofocus
-             class="w-full pl-10 pr-4 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-300 focus:outline-none">
+    <div class="flex gap-2 mb-4 items-stretch">
+      <div class="relative flex-[2]">
+        <svg class="absolute left-3 top-2.5 w-4 h-4 text-gray-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
+        </svg>
+        <input x-model="searchQuery" @input="doSearch()" type="text"
+               placeholder="Search summaries…" autofocus
+               class="w-full pl-10 pr-4 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-300 focus:outline-none">
+      </div>
+      <div class="relative flex-1 min-w-[150px]" @click.away="searchCourseOpen = false">
+        <button @click="searchCourseOpen = !searchCourseOpen"
+                class="w-full border rounded-lg px-3 py-2 text-sm bg-white text-left focus:ring-2 focus:ring-blue-300 focus:outline-none">
+          <span x-text="searchCourseLabel"></span>
+          <span class="float-right ml-2">▾</span>
+        </button>
+        <div x-show="searchCourseOpen" class="absolute right-0 z-10 mt-1 bg-white border rounded-lg shadow-lg max-h-64 overflow-y-auto w-full min-w-[240px]">
+          <input x-model="searchCourseFilterQuery" type="text"
+                 placeholder="搜索课程名…"
+                 class="w-full border-b px-3 py-2 text-sm sticky top-0 bg-white focus:outline-none">
+          <div class="border-b px-3 py-2">
+            <!-- <p class="text-xs text-gray-400 mb-1.5">搜索范围</p> -->
+            <div class="flex flex-wrap gap-1.5">
+              <button @click="toggleSearchDomain('summary')" type="button"
+                      class="text-xs px-3 py-1 rounded-full font-medium transition-colors"
+                      :class="searchDomains.summary
+                        ? 'bg-blue-100 text-blue-700'
+                        : 'bg-gray-100 text-gray-500 hover:bg-gray-200'">
+                摘要
+              </button>
+              <button @click="toggleSearchDomain('transcript')" type="button"
+                      class="text-xs px-3 py-1 rounded-full font-medium transition-colors"
+                      :class="searchDomains.transcript
+                        ? 'bg-blue-100 text-blue-700'
+                        : 'bg-gray-100 text-gray-500 hover:bg-gray-200'">
+                转录
+              </button>
+              <button @click="toggleSearchDomain('ocr')" type="button"
+                      class="text-xs px-3 py-1 rounded-full font-medium transition-colors"
+                      :class="searchDomains.ocr
+                        ? 'bg-blue-100 text-blue-700'
+                        : 'bg-gray-100 text-gray-500 hover:bg-gray-200'">
+                OCR
+              </button>
+            </div>
+          </div>
+          <template x-for="c in searchCourseOptionsFiltered" :key="c.course_id">
+            <label class="flex items-center gap-2 px-3 py-1.5 hover:bg-gray-50 text-sm cursor-pointer">
+              <input type="checkbox" :checked="searchSelectedCourseIds.includes(String(c.course_id))"
+                     @change="toggleSearchCourse(c.course_id, $event.target.checked)"
+                     class="rounded border-gray-300 text-blue-600">
+              <span class="truncate" x-text="c.title || c.course_id"></span>
+            </label>
+          </template>
+          <p x-show="searchCourseOptionsFiltered.length === 0" class="text-xs text-gray-400 px-3 py-2">无匹配课程</p>
+        </div>
+      </div>
     </div>
 
     <div x-show="searchQuery && searchResults.length === 0" class="text-center py-12 text-gray-400 text-sm">
@@ -431,15 +487,24 @@
           <div class="flex items-center justify-between gap-2">
             <p class="text-xs text-blue-600 font-medium truncate" x-text="r.course_title"></p>
             <span class="text-[10px] uppercase tracking-wide text-gray-400 flex-shrink-0"
-                  x-text="r.hit_field === 'transcript' ? '转录命中'
-                        : r.hit_field === 'sub_title'  ? '标题命中'
-                        : '摘要命中'"></span>
+              x-text="r.hit_field === 'transcript' ? '转录命中'
+                : r.hit_field === 'sub_title'  ? '标题命中'
+                : r.hit_field === 'ocr'        ? 'OCR命中'
+                : '摘要命中'"></span>
           </div>
           <h4 class="font-medium text-gray-800 text-sm mt-0.5" x-text="r.sub_title || 'Untitled'"></h4>
-          <p class="text-xs text-gray-400 mt-1 line-clamp-2"
-             x-html="highlight(r.hit_field === 'transcript' ? r.transcript : r.summary, searchQuery)"></p>
+           <p class="text-xs text-gray-400 mt-1 line-clamp-2"
+             x-html="highlight(r.hit_field === 'transcript' ? r.transcript
+                    : r.hit_field === 'ocr' ? r.ppt_text
+                    : r.summary, searchQuery)"></p>
         </button>
       </template>
+    </div>
+    <div x-show="searchHasMore" class="text-center mt-2">
+      <button @click="loadMore()"
+              class="px-4 py-2 text-sm text-blue-600 border border-blue-200 rounded-lg hover:bg-blue-50">
+        加载更多
+      </button>
     </div>
   </div>
 
@@ -520,7 +585,10 @@
                          :checked="subsSelLeft.includes(c.course_id)"
                          @change="toggleSelLeft(c.course_id, $event.target.checked)">
                   <div class="min-w-0 flex-1">
-                    <p class="font-medium text-gray-800 truncate" x-text="c.title || '(无题)'"></p>
+                    <p class="font-medium text-gray-800 truncate">
+                      <span x-text="c.title || '(无题)'"></span>
+                      <span class="text-gray-400 font-normal" x-text="' (' + c.course_id + ')'"></span>
+                    </p>
                     <p class="text-xs text-gray-500 truncate">
                       <span x-text="c.teacher || '—'"></span>
                       <span x-show="c.dept" class="text-gray-400"> · <span x-text="c.dept"></span></span>
@@ -567,6 +635,7 @@
                             :class="termBadgeClass(c.term)"
                             x-text="c.term"></span>
                       <span x-text="c.title || '(无题)'"></span>
+                      <span class="text-gray-400 font-normal" x-text="' (' + c.course_id + ')'"></span>
                     </p>
                     <p class="text-xs text-gray-500 truncate mt-0.5">
                       <span x-text="c.teacher || '—'"></span>
@@ -611,7 +680,10 @@
                          :checked="subsSelRight.includes(c.course_id)"
                          @change="toggleSelRight(c.course_id, $event.target.checked)">
                   <div class="min-w-0 flex-1">
-                    <p class="font-medium text-gray-800 truncate" x-text="c.title || '(无题)'"></p>
+                    <p class="font-medium text-gray-800 truncate">
+                      <span x-text="c.title || '(无题)'"></span>
+                      <span class="text-gray-400 font-normal" x-text="' (' + c.course_id + ')'"></span>
+                    </p>
                     <p class="text-xs text-gray-500 truncate">
                       <span x-text="c.teacher || '—'"></span>
                       <span x-show="c.dept" class="text-gray-400"> · <span x-text="c.dept"></span></span>
@@ -636,6 +708,13 @@
             <div x-show="subsSaving" class="spinner !w-4 !h-4 !border-2 !border-white/30 !border-t-white"></div>
             <span x-text="subsSaving ? '加密上传中…' : '保存订阅到 Secret'"></span>
           </button>
+          <label class="flex items-center gap-1.5 cursor-pointer select-none"
+                 :class="singleRunIds.length === 0 ? 'opacity-40' : ''">
+            <input type="checkbox" x-model="singleRunUseOfficial"
+                   :disabled="singleRunIds.length === 0"
+                   class="w-3.5 h-3.5 rounded border-gray-300 text-emerald-500 focus:ring-emerald-400">
+            <span class="text-xs text-gray-500">官方字幕</span>
+          </label>
           <button @click="runSingleRunWorkflow()" :disabled="singleRunTriggering || singleRunIds.length === 0"
                   class="px-5 py-2.5 bg-emerald-500 text-white rounded-lg text-sm font-medium hover:bg-emerald-600 disabled:opacity-50 flex items-center gap-2">
             <div x-show="singleRunTriggering" class="spinner !w-4 !h-4 !border-2 !border-white/30 !border-t-white"></div>
@@ -706,6 +785,60 @@
 
 </main>
 
+<!-- ── DELETE DIALOG ── -->
+<div x-show="deleteDialogOpen" x-transition.opacity
+     class="fixed inset-0 z-50 bg-black/40 flex items-end md:items-center justify-center p-3"
+     @click.self="closeDeleteDialog()">
+  <div class="w-full max-w-2xl bg-white rounded-xl shadow-xl max-h-[85vh] flex flex-col">
+    <div class="flex items-center justify-between px-4 py-3 border-b border-gray-200">
+      <h3 class="font-semibold text-gray-800">删除课次</h3>
+      <button @click="closeDeleteDialog()" class="text-gray-400 hover:text-gray-600 text-sm">关闭</button>
+    </div>
+
+    <div class="px-4 py-3 border-b border-gray-100 flex items-center justify-between">
+      <label class="inline-flex items-center gap-2 text-sm text-gray-700">
+        <input type="checkbox" class="rounded border-gray-300 text-red-500 focus:ring-red-400"
+               :checked="isDeleteAllSelected()"
+               @change="setDeleteAll($event.target.checked)">
+        <span>全选</span>
+      </label>
+      <span class="text-xs text-gray-500" x-text="'已选 ' + selectedDeleteCount() + ' / ' + getDeletableLectures().length"></span>
+    </div>
+
+    <div class="overflow-y-auto px-4 py-3 space-y-2">
+      <template x-for="lec in getDeletableLectures()" :key="lec.sub_id">
+        <label class="flex items-start gap-3 p-3 border border-gray-100 rounded-lg hover:bg-gray-50 cursor-pointer">
+          <input type="checkbox" class="mt-0.5 rounded border-gray-300 text-red-500 focus:ring-red-400"
+                 :checked="deleteSelection[lec.sub_id]"
+                 @change="toggleDeleteLecture(lec.sub_id, $event.target.checked)">
+          <div class="min-w-0">
+            <p class="text-sm font-medium text-gray-800 truncate" x-text="lec.sub_title || 'Untitled'"></p>
+            <p class="text-xs text-gray-500 mt-1 line-clamp-2" x-text="snippet(lec.summary, 100)"></p>
+          </div>
+        </label>
+      </template>
+      <p x-show="getDeletableLectures().length === 0" class="text-sm text-gray-500 text-center py-8">
+        当前课程无可删除的课次。
+      </p>
+    </div>
+
+    <div class="px-4 py-2 bg-red-50 border-t border-red-100 text-xs text-red-800 leading-relaxed">
+      <p>此操作将删除所选课次的转录、PPT OCR 和摘要数据，并通过 workflow 推送到远端。不可撤销。</p>
+    </div>
+
+    <div class="px-4 py-3 border-t border-gray-100 flex justify-end gap-2">
+      <button @click="closeDeleteDialog()" :disabled="deletingCourses"
+              class="px-4 py-2 text-sm rounded-lg border border-gray-200 text-gray-600 hover:bg-gray-50 disabled:opacity-50">
+        取消
+      </button>
+      <button @click="confirmDelete()" :disabled="deletingCourses || selectedDeleteCount() === 0"
+              class="px-4 py-2 text-sm rounded-lg bg-red-500 text-white hover:bg-red-600 disabled:opacity-50"
+              x-text="deletingCourses ? '删除中…' : '确认删除'">
+      </button>
+    </div>
+  </div>
+</div>
+
 <!-- ── EXPORT DIALOG ── -->
 <div x-show="exportDialogOpen" x-transition.opacity
      class="fixed inset-0 z-50 bg-black/40 flex items-end md:items-center justify-center p-3"
@@ -744,7 +877,7 @@
     </div>
 
     <div class="px-4 py-2 bg-blue-50 border-t border-blue-100 text-xs text-blue-800 leading-relaxed space-y-1">
-      <p>[MD] <strong>复制 Markdown</strong>：合并转录+摘要到剪贴板，纯浏览器端操作，无需网络。</p>
+      <p>[MD] <strong>复制 Markdown</strong>：导出所选课次的摘要到剪贴板，纯浏览器端操作，无需网络。</p>
       <p>[PDF] <strong>触发后台导出</strong>：通过 GitHub Actions 生成 PDF，发送到 RECEIVER_EMAIL。预计 1-3 分钟。</p>
     </div>
 

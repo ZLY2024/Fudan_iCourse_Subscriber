@@ -11,6 +11,10 @@
 
 window.ICS = window.ICS || {};
 
+// Semester terms that predate the recording system — never shown anywhere.
+const _INVALID_TERMS_GLOB = ["*_19_*"];
+const _INVALID_TERMS_EXACT = ["25"];
+
 const _SQL_CDN = "https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.12.0";
 let _db = null;
 let _SQL = null;
@@ -59,13 +63,47 @@ function _exportDB() {
 function _copyRows(src, dst, table) {
   const result = src.exec(`SELECT * FROM ${table}`);
   if (!result.length || !result[0].values.length) return;
-  const cols = result[0].columns;
-  const placeholders = cols.map(() => "?").join(",");
+  // Shard may have extra columns that the frontend's schema no longer
+  // defines (e.g. summary_format_version).  Only copy columns that
+  // actually exist in the destination table.
+  var dstCols = {};
+  try {
+    var info = dst.exec("PRAGMA table_info(" + table + ")");
+    if (info.length && info[0].values) {
+      for (var i = 0; i < info[0].values.length; i++) {
+        dstCols[info[0].values[i][1]] = true;
+      }
+    }
+  } catch (e) { /* fall through — use all source columns */ }
+  const srcCols = result[0].columns;
+  var cols = srcCols;
+  var colIndexes = null;
+  if (Object.keys(dstCols).length) {
+    cols = [];
+    colIndexes = [];
+    for (var j = 0; j < srcCols.length; j++) {
+      if (dstCols[srcCols[j]]) {
+        cols.push(srcCols[j]);
+        colIndexes.push(j);
+      }
+    }
+  }
+  if (!cols.length) return;
+  const placeholders = cols.map(function () { return "?"; }).join(",");
   const stmt = dst.prepare(
-    `INSERT OR IGNORE INTO ${table} (${cols.join(",")}) VALUES (${placeholders})`
+    "INSERT OR IGNORE INTO " + table + " (" + cols.join(",") + ") VALUES (" + placeholders + ")"
   );
-  for (const row of result[0].values) {
-    stmt.bind(row);
+  for (var k = 0; k < result[0].values.length; k++) {
+    var row = result[0].values[k];
+    if (colIndexes) {
+      var filtered = [];
+      for (var m = 0; m < colIndexes.length; m++) {
+        filtered.push(row[colIndexes[m]]);
+      }
+      stmt.bind(filtered);
+    } else {
+      stmt.bind(row);
+    }
     stmt.step();
     stmt.reset();
   }
@@ -99,9 +137,19 @@ async function _attachShard(shardBytes) {
 }
 
 function _deriveState(row) {
+  // "no_video" is a soft error stage the backend records when the lecture
+  // has no playable video yet (it retries a few runs in case the recording
+  // appears later).  Render it as a gray informational badge, not a red
+  // failure.
+  if (row.error_stage === "no_video") return "novideo";
   if (row.error_stage) return "failed";
   if (row.summary && row.processed_at) return "ready";
-  if (row.transcript && !row.summary) return "processing";
+  // Processed, no summary, no error = a lecture the backend permanently
+  // skipped (no audio stream / empty transcript) and marked done.
+  // Distinct from "waiting" (enqueued, not yet run) so these don't show
+  // as perpetually pending in the UI.
+  if (row.processed_at) return "skipped";
+  if (row.transcript) return "processing";
   return "waiting";
 }
 
@@ -128,12 +176,44 @@ function _getCourses() {
   `);
 }
 
+// Sort key parsed straight from sub_title — we deliberately do NOT trust the
+// `date` column. `date` is itself just substr(sub_title,1,10) on the backend
+// and is inconsistently back-filled: unprocessed lectures often ship with an
+// empty `date`, and `ORDER BY date` then floats that whole block ahead of the
+// populated rows (the cause of the two-run, out-of-chronological-order list).
+// Parsing sub_title here gives a reliable chronological order regardless.
+//   "2026-03-09第6-8节" -> { dateNum: 20260309, period: 6 }
+function _lectureOrderKey(subTitle) {
+  var s = String(subTitle || "");
+  var dm = s.match(/(\d{4})-(\d{1,2})-(\d{1,2})/);
+  var dateNum = dm
+    ? parseInt(dm[1], 10) * 10000 + parseInt(dm[2], 10) * 100 + parseInt(dm[3], 10)
+    : null;
+  var pm = s.match(/第\s*(\d+)/);  // first period number, e.g. 第11-12节 -> 11
+  var period = pm ? parseInt(pm[1], 10) : 0;
+  return { dateNum: dateNum, period: period, raw: s };
+}
+
 function _getLectures(courseId) {
   const rows = _queryAll(`
     SELECT sub_id, sub_title, date, summary, processed_at,
            error_stage, error_msg, summary_model, transcript
-    FROM lectures WHERE course_id = ? ORDER BY sub_id ASC
+    FROM lectures WHERE course_id = ?
   `, [courseId]);
+  // Chronological ascending (earliest first); 第N-M节 breaks intra-day ties so
+  // a morning session sorts before an afternoon one. Lectures with no parseable
+  // date in their sub_title sort last (their position is genuinely unknown).
+  rows.sort(function (a, b) {
+    var ka = _lectureOrderKey(a.sub_title), kb = _lectureOrderKey(b.sub_title);
+    if (ka.dateNum === null || kb.dateNum === null) {
+      if (ka.dateNum === null && kb.dateNum === null)
+        return ka.raw < kb.raw ? -1 : (ka.raw > kb.raw ? 1 : 0);
+      return ka.dateNum === null ? 1 : -1;
+    }
+    if (ka.dateNum !== kb.dateNum) return ka.dateNum - kb.dateNum;
+    if (ka.period !== kb.period) return ka.period - kb.period;
+    return ka.raw < kb.raw ? -1 : (ka.raw > kb.raw ? 1 : 0);
+  });
   return rows.map((r) => {
     r.state = _deriveState(r);
     delete r.transcript;
@@ -164,56 +244,107 @@ function _getPptPages(subId) {
   `, [subId]);
 }
 
-function _searchSummaries(query) {
-  if (!query?.trim()) return [];
-  // Match against summary, transcript, and sub_title.  Transcript is the
-  // most useful for "I remember the teacher said X" lookups; summary
-  // covers "I read it in the notes"; sub_title covers session names.
-  // We mark which field hit so the UI can show the right snippet.
+function _searchSummaries(query, courseIds, page, pageSize, domains) {
+  if (!query?.trim()) return { results: [], page: 1, hasMore: false };
+  page = page || 1;
+  pageSize = pageSize || 50;
+  const offset = (page - 1) * pageSize;
   const q = query;
-  return _queryAll(`
+
+  // Domain flags — default all enabled
+  const d = domains || {};
+  const matchSummary = d.summary !== false;
+  const matchTranscript = d.transcript !== false;
+  const matchOcr = d.ocr !== false;
+
+  // Build WHERE parts per active domain
+  var textParts = [];
+  var textParams = [];
+  function addText(cond) { textParts.push(cond); textParams.push(q); }
+  if (matchSummary)    addText("l.summary    LIKE '%' || ? || '%'");
+  if (matchTranscript) addText("l.transcript LIKE '%' || ? || '%'");
+  if (matchOcr)        addText("EXISTS(SELECT 1 FROM ppt_pages pp3 WHERE pp3.sub_id = l.sub_id AND pp3.ocr_status = 'done' AND pp3.text LIKE '%' || ? || '%')");
+
+  if (!textParts.length) return { results: [], page: 1, hasMore: false };
+
+  // Build hit_field CASE for active domains
+  var caseParts = [];
+  var caseParams = [];
+  function addCase(when, then) { caseParts.push("WHEN " + when + " THEN '" + then + "'"); caseParams.push(q); }
+  if (matchSummary)    addCase("l.summary    LIKE '%' || ? || '%'", "summary");
+  if (matchTranscript) addCase("l.transcript LIKE '%' || ? || '%'", "transcript");
+  if (matchOcr)        addCase("EXISTS(SELECT 1 FROM ppt_pages pp2 WHERE pp2.sub_id = l.sub_id AND pp2.ocr_status = 'done' AND pp2.text LIKE '%' || ? || '%')", "ocr");
+
+  // ppt_text subquery (for OCR snippet, only when OCR domain active)
+  var pptSql = matchOcr
+    ? "(SELECT pp.text FROM ppt_pages pp WHERE pp.sub_id = l.sub_id AND pp.ocr_status = 'done' AND pp.text LIKE '%' || ? || '%' LIMIT 1)"
+    : "NULL";
+  var pptParams = matchOcr ? [q] : [];
+
+  // Full params: ppt_text + CASE + WHERE
+  var params = pptParams.concat(caseParams, textParams);
+
+  // WHERE clause with optional course filter
+  var whereClauses = ["(" + textParts.join("\n           OR ") + ")"];
+  if (courseIds && courseIds.length) {
+    var placeholders = courseIds.map(function () { return "?"; }).join(",");
+    whereClauses.push("l.course_id IN (" + placeholders + ")");
+    courseIds.forEach(function (id) { params.push(String(id)); });
+  }
+
+  var caseSql = caseParts.length
+    ? "CASE\n             " + caseParts.join("\n             ") + "\n             ELSE 'other'\n           END"
+    : "'other'";
+
+  // Fetch pageSize+1 rows to detect whether a next page exists
+  var rows = _queryAll(`
     SELECT l.sub_id, l.sub_title, l.summary, l.transcript,
+           ${pptSql} AS ppt_text,
            l.course_id, c.title AS course_title,
-           CASE
-             WHEN l.summary    LIKE '%' || ? || '%' THEN 'summary'
-             WHEN l.sub_title  LIKE '%' || ? || '%' THEN 'sub_title'
-             WHEN l.transcript LIKE '%' || ? || '%' THEN 'transcript'
-             ELSE 'other'
-           END AS hit_field
+           ${caseSql} AS hit_field
     FROM lectures l JOIN courses c ON l.course_id = c.course_id
-    WHERE l.summary    LIKE '%' || ? || '%'
-       OR l.sub_title  LIKE '%' || ? || '%'
-       OR l.transcript LIKE '%' || ? || '%'
-    ORDER BY l.processed_at DESC LIMIT 50
-  `, [q, q, q, q, q, q]);
+    WHERE ` + whereClauses.join(" AND ") + `
+    ORDER BY l.processed_at DESC, l.sub_id DESC LIMIT ? OFFSET ?
+  `, params.concat([pageSize + 1, offset]));
+
+  var hasMore = rows.length > pageSize;
+  if (hasMore) rows.pop();
+  return { results: rows, page: page, hasMore: hasMore };
 }
 
-function _getAllCourses(term) {
-  // Catalog of every course offered by the school for ``term`` (or all
-  // terms if undefined).  Populated by main.py's CRAWL_TERM-driven crawl;
-  // empty until that env var has been set at least once on the CI side.
-  if (term) {
-    return _queryAll(
-      "SELECT * FROM all_courses WHERE term = ? ORDER BY title",
-      [term],
-    );
+function _invalidTermExclusion() {
+  // Single source of truth for excluding pre-recording-system terms. Used by
+  // both the catalog WHERE builder and the term dropdown so the two never
+  // diverge (they previously used different mechanisms — SQL GLOB here vs a
+  // JS substring test in the dropdown — which could disagree).
+  var clauses = [];
+  var params = [];
+  for (var gi = 0; gi < _INVALID_TERMS_GLOB.length; gi++) {
+    clauses.push("term NOT GLOB ?");
+    params.push(_INVALID_TERMS_GLOB[gi]);
   }
-  return _queryAll(
-    "SELECT * FROM all_courses ORDER BY term DESC, title"
-  );
+  for (var ei = 0; ei < _INVALID_TERMS_EXACT.length; ei++) {
+    clauses.push("term != ?");
+    params.push(_INVALID_TERMS_EXACT[ei]);
+  }
+  return { clauses: clauses, params: params };
 }
 
 function _getAllCoursesTerms() {
+  var ex = _invalidTermExclusion();
+  var where = ex.clauses.length ? "WHERE " + ex.clauses.join(" AND ") : "";
   return _queryAll(
-    "SELECT DISTINCT term FROM all_courses ORDER BY term DESC"
-  ).map((r) => r.term);
+    "SELECT DISTINCT term FROM all_courses " + where + " ORDER BY term DESC",
+    ex.params,
+  ).map(function (r) { return r.term; });
 }
 
 function _buildCatalogWhere(filters) {
   // Shared WHERE/params builder for paged search + count + dept distinct.
   // Filters: { terms: string[], depts: string[], title: string, teacher: string }
-  var clauses = [];
-  var params = [];
+  var ex = _invalidTermExclusion();
+  var clauses = ex.clauses.slice();
+  var params = ex.params.slice();
   if (filters.terms && filters.terms.length) {
     clauses.push("term IN (" + filters.terms.map(function () { return "?"; }).join(",") + ")");
     for (var i = 0; i < filters.terms.length; i++) params.push(filters.terms[i]);
@@ -312,13 +443,6 @@ function _getAllCoursesDepts(termFilter, search) {
   return rows.map(function (r) { return r.dept; });
 }
 
-function _getSubscribedCourseIds() {
-  // The ``courses`` table holds courses we've actually run.  This is our
-  // best signal of "currently subscribed" without reading the
-  // COURSE_IDS secret (which GitHub never exposes back).
-  return _queryAll("SELECT course_id FROM courses").map((r) => r.course_id);
-}
-
 function _getMeta(key) {
   var rows = _queryAll("SELECT value FROM meta WHERE key = ?", [key]);
   return rows.length ? rows[0].value : null;
@@ -334,12 +458,10 @@ window.ICS.db = {
   getLecture: _getLecture,
   getPptPages: _getPptPages,
   searchSummaries: _searchSummaries,
-  getAllCourses: _getAllCourses,
   getAllCoursesTerms: _getAllCoursesTerms,
   searchAllCourses: _searchAllCourses,
   countAllCourses: _countAllCourses,
   getCoursesByIds: _getCoursesByIds,
   getAllCoursesDepts: _getAllCoursesDepts,
-  getSubscribedCourseIds: _getSubscribedCourseIds,
   getMeta: _getMeta,
 };

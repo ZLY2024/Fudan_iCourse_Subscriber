@@ -31,15 +31,16 @@ MODEL_PROVIDERS: list[dict] = [
         "base_url_env": "DASHSCOPE_BASE_URL",
         "default_base_url": "https://api-inference.modelscope.cn/v1/",
         "models": [
-            "deepseek-ai/DeepSeek-V4-Pro",
-            "deepseek-ai/DeepSeek-V4-Flash"
+            "deepseek-ai/DeepSeek-V4-Pro-0813",
+            "deepseek-ai/DeepSeek-V4.1-Flash"
+            
         ],
     },
     {
         "name": "deepseek",
         "api_key_env": "DEEPSEEK_API_KEY",
         "base_url_env": "DEEPSEEK_BASE_URL",
-        "default_base_url": "https://api.deepseek.com",
+        "default_base_url": "https://api.deepseek.com/v1",
         "models": [
             "deepseek-v4-flash"
         ],
@@ -164,12 +165,10 @@ VIDEO_DOWNLOAD_CONCURRENCY = int(
     os.environ.get("VIDEO_DOWNLOAD_CONCURRENCY", "2")
 )
 
-# Resummarize phase opt-in.  Re-running OCR + LLM on every old lecture is
-# expensive (each lecture ~ a minute of LLM + 30 OCR calls); we don't want
-# every nightly run paying that cost.  Set RESUMMARIZE_OLD=1 to enable for
-# a one-shot manual workflow run.  Default off.
-RESUMMARIZE_OLD_ENABLED = os.environ.get("RESUMMARIZE_OLD", "").strip() in (
-    "1", "true", "yes", "on",
+# 是否优先使用 iCourse 官方字幕（跳过 ASR 转录）。默认关闭。
+USE_OFFICIAL_TRANSCRIPT = (
+    os.environ.get("USE_OFFICIAL_TRANSCRIPT", "").strip().lower()
+    in ("1", "true", "yes")
 )
 
 # 监控的课程 ID 列表

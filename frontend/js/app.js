@@ -252,11 +252,16 @@ document.addEventListener("alpine:init", () => {
     currentPptPages: [],
     detailView: "summary",
     searchQuery: "", searchResults: [],
+    searchCourseFilterQuery: "", searchSelectedCourseIds: [],
+    searchCourseOpen: false,
+    searchPage: 1, searchHasMore: false,
+    searchDomains: { summary: true, transcript: true, ocr: true },
     commitSha: null,
     setup: { token: "", stuid: "", uispsw: "" },
     setupError: "", setupTesting: false,
     settingsForm: {}, showSecrets: {},
     exportDialogOpen: false, exportSelection: {}, exportingPdf: false,
+    deleteDialogOpen: false, deleteSelection: {}, deletingCourses: false,
     repoOwner: "", repoName: "", dataBranch: "data",
     _history: [],
     /* Subscriptions editor state — three-column layout:
@@ -277,6 +282,7 @@ document.addEventListener("alpine:init", () => {
     _subsFilterTimer: null, _deptFilterTimer: null,
     subsSaving: false, subsError: "",
     singleRunTriggering: false,
+    singleRunUseOfficial: false,
     /* Per-browser pinned-courses set, lazily synced to localStorage. */
     starred: _loadStarred(),
 
@@ -324,11 +330,8 @@ document.addEventListener("alpine:init", () => {
           );
         }
 
-        var sorted = this._sortCoursesByStar(ICS.db.getCourses());
-        this.courses = sorted;
+        this.courses = this._sortCoursesByStar(ICS.db.getCourses());
         this.view = "courses";
-        var self = this;
-        this.$nextTick(function () { self.courses = self._sortCoursesByStar(self.courses); });
       } catch (e) {
         this.error = e.message;
         this.view = "error";
@@ -355,6 +358,20 @@ document.addEventListener("alpine:init", () => {
         this.currentPptPages = this.currentLecture
           ? ICS.db.getPptPages(this.currentLecture.sub_id)
           : [];
+        // Opening from search lands here without a matching course context;
+        // load the lecture's own course so prev/next nav + the lectures list
+        // (used by _currentLectureIndex) are correct rather than stale/empty.
+        if (this.currentLecture) {
+          var cid = String(this.currentLecture.course_id);
+          if (!this.currentCourse || String(this.currentCourse.course_id) !== cid) {
+            this.currentCourse =
+              this.courses.find((x) => String(x.course_id) === cid)
+              || { course_id: cid,
+                   title: this.currentLecture.course_title || "",
+                   teacher: this.currentLecture.teacher || "" };
+            this.lectures = ICS.db.getLectures(cid);
+          }
+        }
         this.detailView = "summary";
       }
       this.view = view;
@@ -381,8 +398,9 @@ document.addEventListener("alpine:init", () => {
     openLecture(id) { this.navigate("detail", { subId: id }); },
 
     /* Prev/next within the current course's lecture list.  Lectures are
-       ordered ascending by sub_id (matches the lectures view), so "prev"
-       is the lecture at index-1 and "next" is at index+1. */
+       ordered chronologically (parsed from sub_title; see db.js
+       _lectureOrderKey), matching the lectures view, so "prev" is the
+       lecture at index-1 and "next" is at index+1. */
     _currentLectureIndex() {
       if (!this.currentLecture || !this.lectures) return -1;
       return this.lectures.findIndex(
@@ -534,12 +552,6 @@ document.addEventListener("alpine:init", () => {
           lines.push(lec.summary);
           lines.push("");
         }
-        if (lec.transcript) {
-          lines.push("### 转录文本");
-          lines.push("");
-          lines.push(lec.transcript);
-          lines.push("");
-        }
         lines.push("---");
         lines.push("");
       }
@@ -554,12 +566,119 @@ document.addEventListener("alpine:init", () => {
       }
     },
 
+    getDeletableLectures() {
+      return (this.lectures || []).filter((lec) => lec.state === "ready");
+    },
+    openDeleteDialog() {
+      const list = this.getDeletableLectures();
+      if (!list.length) { this._toast("没有可删除的课次", "error"); return; }
+      this.deleteSelection = {};
+      list.forEach((lec) => { this.deleteSelection[lec.sub_id] = false; });
+      this.deleteDialogOpen = true;
+    },
+    closeDeleteDialog() {
+      if (this.deletingCourses) return;
+      this.deleteDialogOpen = false;
+    },
+    toggleDeleteLecture(subId, checked) { this.deleteSelection[subId] = !!checked; },
+    setDeleteAll(checked) {
+      this.getDeletableLectures().forEach((lec) => { this.deleteSelection[lec.sub_id] = !!checked; });
+    },
+    isDeleteAllSelected() {
+      const list = this.getDeletableLectures();
+      return list.length > 0 && list.every((lec) => this.deleteSelection[lec.sub_id]);
+    },
+    selectedDeleteCount() {
+      return this.getDeletableLectures().filter((lec) => this.deleteSelection[lec.sub_id]).length;
+    },
+    async confirmDelete() {
+      if (this.deletingCourses) return;
+      const selected = this.getDeletableLectures().filter(
+        (lec) => this.deleteSelection[lec.sub_id]
+      );
+      if (!selected.length) {
+        this._toast("请至少选择一节课程", "error");
+        return;
+      }
+      const creds = _loadCreds();
+      if (!creds?.token) {
+        this._toast("未登录或 PAT 缺失", "error");
+        return;
+      }
+      this.deletingCourses = true;
+      try {
+        var currentCid = this.currentCourse ? String(this.currentCourse.course_id) : null;
+        var selectedSubIds = selected.map(function (l) { return String(l.sub_id); });
+
+        await ICS.github.triggerDeleteWorkflow(
+          this.repoOwner, this.repoName, "main", creds.token,
+          [currentCid], selectedSubIds,
+        );
+        this.deleteDialogOpen = false;
+        this._toast("已触发删除 workflow，数据将在几分钟内从远端清除", "success");
+        setTimeout(() => { this._go("courses"); }, 1500);
+      } catch (e) {
+        this._toast(e?.message || "删除失败", "error");
+      } finally {
+        this.deletingCourses = false;
+      }
+    },
+
     _searchTimeout: null,
+    get searchCourseLabel() {
+      if (!this.searchSelectedCourseIds.length) return "全部课程";
+      return "已选" + this.searchSelectedCourseIds.length + "门";
+    },
+    get searchCourseOptionsFiltered() {
+      var q = (this.searchCourseFilterQuery || "").trim().toLowerCase();
+      var list = this.courses || [];
+      if (!q) return list;
+      return list.filter(function (c) {
+        var title = String(c?.title || "").toLowerCase();
+        var teacher = String(c?.teacher || "").toLowerCase();
+        var cid = String(c?.course_id || "").toLowerCase();
+        return title.indexOf(q) !== -1 || teacher.indexOf(q) !== -1 || cid.indexOf(q) !== -1;
+      });
+    },
+    toggleSearchCourse(courseId, checked) {
+      var cid = String(courseId);
+      var s = new Set(this.searchSelectedCourseIds.map(String));
+      if (checked) s.add(cid); else s.delete(cid);
+      this.searchSelectedCourseIds = Array.from(s);
+      this.doSearch();
+    },
     doSearch() {
       clearTimeout(this._searchTimeout);
       this._searchTimeout = setTimeout(() => {
-        this.searchResults = this.searchQuery.trim() ? ICS.db.searchSummaries(this.searchQuery) : [];
+        this._loadSearchResults(1);
       }, 300);
+    },
+    _loadSearchResults(page) {
+      if (!this.searchQuery.trim()) {
+        this.searchResults = [];
+        this.searchHasMore = false;
+        this.searchPage = 1;
+        return;
+      }
+      var result = ICS.db.searchSummaries(
+        this.searchQuery, this.searchSelectedCourseIds,
+        page, 50, this.searchDomains,
+      );
+      if (page <= 1) {
+        this.searchResults = result.results;
+      } else {
+        [].push.apply(this.searchResults, result.results);
+      }
+      this.searchPage = result.page;
+      this.searchHasMore = result.hasMore;
+    },
+    loadMore() {
+      this._loadSearchResults(this.searchPage + 1);
+    },
+    toggleSearchDomain(domain) {
+      this.searchDomains = Object.assign({}, this.searchDomains);
+      this.searchDomains[domain] = !this.searchDomains[domain];
+      this.doSearch();
     },
 
     async refresh() {
@@ -870,7 +989,7 @@ document.addEventListener("alpine:init", () => {
         // than overloading the scheduled check workflow.
         await ICS.github.triggerSingleRunWorkflow(
           this.repoOwner, this.repoName, "main", creds.token,
-          this.singleRunIds,
+          this.singleRunIds, this.singleRunUseOfficial,
         );
         this._toast(
           "已触发单次运行，处理 " + this.singleRunIds.length + " 门课。请到 Actions 查看进度",

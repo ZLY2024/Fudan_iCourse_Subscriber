@@ -83,9 +83,10 @@ The strategy:
 
     2. Otherwise — read the previously persisted value from
        ``meta('subscribed_course_ids')``.  ``single_run.yml``,
-       ``reshard.yml``, and manual reshards take this path; they would
-       otherwise be at risk of treating their one-shot ``COURSE_IDS``
-       input as the full subscription and corrupting the bin layout.
+       ``delete_course.yml``, and manual reshards take this path; they
+       would otherwise be at risk of treating their one-shot
+       ``COURSE_IDS`` input as the full subscription and corrupting the
+       bin layout.
 
 LAYOUT under ``output_dir``
 ===========================
@@ -307,8 +308,8 @@ def _build_meta_shard(source_db: str, output_path: str) -> None:
     """Build a tiny metadata-only shard containing ``all_courses`` and
     ``meta``.
 
-    ``all_courses`` changes infrequently (catalog refresh: 5th/25th of
-    the month).  ``meta`` changes whenever PSA state or the persisted
+    ``all_courses`` changes when a new semester is discovered and its
+    catalog is fetched.  ``meta`` changes whenever PSA state or the persisted
     subscription set changes — both of which happen at most once per
     run.  Keeping this in a dedicated tiny shard lets the frontend's
     subscription editor know the catalog without decrypting any
@@ -524,7 +525,7 @@ def _migrate_shard_schema(target: sqlite3.Connection) -> None:
     """Ensure every attached shard has the same columns as ``main``.
 
     Older shards (created by previous code versions) may lack migration
-    columns like ``old_summary``, which causes ``INSERT ... SELECT *``
+    columns (from previous schema versions), which causes ``INSERT ... SELECT *``
     to fail with a column-count mismatch.  Adding the missing column
     to the shard before the INSERT makes the ``*`` lists match.
     """
@@ -559,11 +560,17 @@ def _migrate_shard_schema(target: sqlite3.Connection) -> None:
             migrate = PPT_PAGES_MIGRATION_COLUMNS
         else:
             migrate = []
+        # Add columns that main has but shard is missing.
         for col, typedef in migrate:
             if col in main_cols and col not in shard_cols:
                 target.execute(
                     f"ALTER TABLE shard.{table} ADD COLUMN {col} {typedef}"
                 )
+        # Drop columns that shard has but main no longer has (schema
+        # evolution — e.g. ``summary_format_version``, ``old_summary``).
+        extra_cols = shard_cols - main_cols
+        for col in extra_cols:
+            target.execute(f"ALTER TABLE shard.{table} DROP COLUMN {col}")
 
 
 def reassemble_database(

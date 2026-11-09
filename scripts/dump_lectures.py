@@ -57,7 +57,7 @@ def dump_one(db: sqlite3.Connection, sub_id: str, out_dir: str) -> str:
         f.write(f"- **course_id**: {lec['course_id']}  \n")
         f.write(f"- **date**: {lec['date']}  \n")
         f.write(f"- **teacher**: {lec['teacher']}  \n")
-        f.write(f"- **model**: {lec['summary_model']} (v{lec['summary_format_version']})  \n")
+        f.write(f"- **model**: {lec['summary_model']}  \n")
         f.write(f"- **processed_at**: {lec['processed_at']}  \n")
         f.write(f"- **transcript chars**: {len(transcript)}  \n")
         f.write(f"- **summary chars**: {len(summary)}  \n")
