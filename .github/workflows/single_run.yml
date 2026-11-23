@@ -161,6 +161,7 @@ jobs:
         env:
           StuId: ${{ secrets.STUID }}
           UISPsw: ${{ secrets.UISPSW }}
+          UIS_TOTP_SECRET: ${{ secrets.UIS_TOTP_SECRET }}
           COURSE_IDS: ${{ inputs.course_ids }}
           USE_OFFICIAL_TRANSCRIPT: ${{ inputs.use_official_transcript && '1' || '' }}
           SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
@@ -232,3 +233,10 @@ jobs:
           git commit -q -m "chore: update encrypted database (sharded v2)"
           git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
           git push --force origin data
+
+  request-cleanup:
+    needs: run
+    if: ${{ always() }}
+    permissions:
+      actions: write
+    uses: ./.github/workflows/request-cleanup.yml

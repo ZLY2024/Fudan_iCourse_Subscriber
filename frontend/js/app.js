@@ -246,6 +246,7 @@ async function _loadFromLegacyBlob(manifest, owner, repo, secrets, token) {
 document.addEventListener("alpine:init", () => {
   Alpine.data("app", () => ({
     view: "loading", error: null, loadingMsg: "",
+    agent: null, agentError: "",
     toast: null, toastType: "success",
     courses: [], lectures: [],
     currentCourse: null, currentLecture: null,
@@ -281,12 +282,14 @@ document.addEventListener("alpine:init", () => {
     _subsSubscribedCache: [], _subsSingleRunCache: [], _subsDeptCache: [],
     _subsFilterTimer: null, _deptFilterTimer: null,
     subsSaving: false, subsError: "",
+    subsLoading: false, subsStale: false,
     singleRunTriggering: false,
     singleRunUseOfficial: false,
     /* Per-browser pinned-courses set, lazily synced to localStorage. */
     starred: _loadStarred(),
 
     async init() {
+      this._loadAgent();
       const detected = ICS.github.detectRepo();
       const s = _loadSettings();
       this.repoOwner = s.owner || (detected?.owner ?? "");
@@ -296,6 +299,19 @@ document.addEventListener("alpine:init", () => {
       if (!creds) { this.view = "setup"; return; }
       await this._loadDB(creds);
     },
+
+    async _loadAgent() {
+      try {
+        const { makeAgentUI } = await import("./agent-ui.js");
+        this.agent = await makeAgentUI(this);
+        this.agent.connectMedia();
+      } catch (error) {
+        console.error(error);
+        this.agentError = "无法载入课程问答。请刷新页面后重试。";
+      }
+    },
+
+    openAgent() { this.navigate("agent"); },
 
     async _loadDB(creds) {
       this.view = "loading"; this.error = null;
@@ -340,10 +356,12 @@ document.addEventListener("alpine:init", () => {
 
     navigate(view, params) {
       params = params || {};
-      this._history.push({ view: this.view, courseId: this.currentCourse?.course_id, lectureId: this.currentLecture?.sub_id });
+      this._history.push({ view: this.view, courseId: this.currentCourse?.course_id,
+        lectureId: this.currentLecture?.sub_id, detailView: this.detailView });
       this._go(view, params);
     },
     _go(view, params) {
+      this.agent?.rememberReading();
       params = params || {};
       this.error = null;
       if (view === "courses") {
@@ -372,7 +390,7 @@ document.addEventListener("alpine:init", () => {
             this.lectures = ICS.db.getLectures(cid);
           }
         }
-        this.detailView = "summary";
+        this.detailView = params.detailView ?? "summary";
       }
       this.view = view;
       if (view !== "lectures") this.exportDialogOpen = false;
@@ -390,12 +408,12 @@ document.addEventListener("alpine:init", () => {
     },
     goBack() {
       const p = this._history.pop();
-      if (p) this._go(p.view, { courseId: p.courseId, subId: p.lectureId });
+      if (p) this._go(p.view, { courseId: p.courseId, subId: p.lectureId, detailView: p.detailView });
       else this._go("courses");
     },
 
     openCourse(id) { this.navigate("lectures", { courseId: id }); },
-    openLecture(id) { this.navigate("detail", { subId: id }); },
+    openLecture(id, detailView) { this.navigate("detail", { subId: id, detailView }); },
 
     /* Prev/next within the current course's lecture list.  Lectures are
        ordered chronologically (parsed from sub_title; see db.js
@@ -724,6 +742,7 @@ document.addEventListener("alpine:init", () => {
     },
 
     openSettings() {
+      this.agent?.openSettings();
       this.settingsForm = { ...(_loadCreds() || {}) };
       this.showSecrets = {};
       this.navigate("settings");
@@ -737,8 +756,14 @@ document.addEventListener("alpine:init", () => {
     },
     clearAllData() {
       if (!confirm("Clear all saved credentials?")) return;
+      this.agent?.clearCredentials();
       localStorage.removeItem(_LS + "creds");
       localStorage.removeItem(_LS + "settings");
+      localStorage.removeItem(_LS + "lastSubscribed");
+      for (var i = localStorage.length - 1; i >= 0; i--) {
+        var key = localStorage.key(i);
+        if (key && key.startsWith(_LS + "lastSubscribed:")) localStorage.removeItem(key);
+      }
       // Close the cached connection before deleting — Chrome/Firefox block
       // deleteDatabase indefinitely while any handle is still open.
       if (_idbPromise) {
@@ -751,7 +776,11 @@ document.addEventListener("alpine:init", () => {
     },
 
     // ── Subscriptions editor (three-column) ──────────────────────────
-    openSubscriptions() {
+    _subscriptionCacheKey() {
+      return _LS + "lastSubscribed:" + this.repoOwner.toLowerCase()
+        + "/" + this.repoName.toLowerCase();
+    },
+    async openSubscriptions() {
       try {
         this._go("subscriptions");
       } catch (e) {
@@ -777,28 +806,41 @@ document.addEventListener("alpine:init", () => {
       this._subsSingleRunCache = [];
       this._subsDeptCache = [];
       this.subsError = "";
-
-      // Load subscription (localStorage → meta table fallback)
+      this.subsLoading = true;
+      this.subsStale = false;
       this.subscribedIds = [];
       try {
-        var cached = JSON.parse(
-          localStorage.getItem(_LS + "lastSubscribed") || "null"
+        var creds = _loadCreds();
+        var info = await ICS.github.getCourseIdsSecretInfo(
+          this.repoOwner, this.repoName, creds.token,
         );
-        if (Array.isArray(cached)) this.subscribedIds = cached.map(String);
-      } catch {}
-      if (!this.subscribedIds.length) {
-        try { var metaRaw = ICS.db.getMeta("course_ids"); } catch (e) { metaRaw = null; }
-        if (metaRaw) {
-          this.subscribedIds = metaRaw.split(",")
-            .map(function (s) { return s.trim(); })
-            .filter(Boolean);
-          try {
-            localStorage.setItem(
-              _LS + "lastSubscribed",
-              JSON.stringify(this.subscribedIds),
-            );
-          } catch {}
+        var cached = null;
+        try { cached = JSON.parse(localStorage.getItem(this._subscriptionCacheKey()) || "null"); } catch {}
+        var metaRaw = ICS.db.getMeta("course_ids");
+        var syncedAt = ICS.db.getMeta("course_ids_synced_at");
+        // GitHub may round secret timestamps to seconds. Keep a small margin
+        // so a write near the workflow snapshot cannot look synchronized.
+        if (!info) {
+          this.subscribedIds = [];
+        } else if (cached && Array.isArray(cached.ids)
+                   && cached.updatedAt === info.updated_at) {
+          this.subscribedIds = cached.ids.map(String);
+        } else if (syncedAt && Date.parse(syncedAt) >= Date.parse(info.updated_at) + 2000) {
+          this.subscribedIds = (metaRaw || "").split(",").map(function(s) { return s.trim(); }).filter(Boolean);
+        } else {
+          this.subsStale = true;
+          this.subsError = "Secret 已更新，但数据库尚未同步当前订阅。请在 iCourse Check 工作流完成后刷新页面。";
         }
+        if (!this.subsStale) {
+          localStorage.setItem(this._subscriptionCacheKey(), JSON.stringify({
+            ids: this.subscribedIds, updatedAt: info?.updated_at || null,
+          }));
+        }
+      } catch (e) {
+        this.subsStale = true;
+        this.subsError = e?.message || "无法检查当前订阅";
+      } finally {
+        this.subsLoading = false;
       }
       this._refreshSubscribedCache();
       this._refreshSingleRunCache();
@@ -903,6 +945,7 @@ document.addEventListener("alpine:init", () => {
     },
     // ── Triangle-arrow operations ────────────────────────────────────
     moveToSubscribed() {
+      if (this.subsLoading || this.subsStale || this.subsSaving) return;
       var target = new Set(this.subscribedIds.map(String));
       var selected = this.subsSelMiddle;
       for (var i = 0; i < selected.length; i++) target.add(selected[i]);
@@ -911,6 +954,7 @@ document.addEventListener("alpine:init", () => {
       this._refreshSubscribedCache();
     },
     moveFromSubscribed() {
+      if (this.subsLoading || this.subsStale || this.subsSaving) return;
       var target = new Set(this.subscribedIds.map(String));
       var selected = this.subsSelLeft;
       for (var i = 0; i < selected.length; i++) target.delete(selected[i]);
@@ -936,7 +980,7 @@ document.addEventListener("alpine:init", () => {
     },
     // ── Save left column to GitHub Secret ────────────────────────────
     async saveSubscriptions() {
-      if (this.subsSaving) return;
+      if (this.subsSaving || this.subsLoading || this.subsStale) return;
       var creds = _loadCreds();
       if (!creds?.token) {
         this.subsError = "未登录或 PAT 缺失。";
@@ -948,20 +992,27 @@ document.addEventListener("alpine:init", () => {
       }
       this.subsSaving = true;
       this.subsError = "";
+      var savedIds = this.subscribedIds.slice();
       try {
         var written = await ICS.github.setCourseIdsSecret(
-          this.repoOwner, this.repoName, creds.token, this.subscribedIds,
-        );
-        this._toast(
-          "已保存 " + written.split(",").filter(Boolean).length + " 门课到 COURSE_IDS secret",
-          "success",
+          this.repoOwner, this.repoName, creds.token, savedIds,
         );
         try {
-          localStorage.setItem(
-            _LS + "lastSubscribed",
-            JSON.stringify(this.subscribedIds),
+          var info = await ICS.github.getCourseIdsSecretInfo(
+            this.repoOwner, this.repoName, creds.token,
           );
-        } catch {}
+          if (!info) throw new Error("COURSE_IDS Secret 写入后无法读取元数据");
+          localStorage.setItem(this._subscriptionCacheKey(), JSON.stringify({
+            ids: savedIds, updatedAt: info.updated_at,
+          }));
+          this._toast(
+            "已保存 " + written.split(",").filter(Boolean).length + " 门课到 COURSE_IDS secret",
+            "success",
+          );
+        } catch (e) {
+          this.subsStale = true;
+          this.subsError = "Secret 已写入，但无法核对本地记录。请在 iCourse Check 工作流完成后刷新页面。";
+        }
       } catch (e) {
         this.subsError = e?.message || "保存失败";
       } finally {
