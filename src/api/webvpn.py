@@ -141,9 +141,29 @@ class WebVPNSession:
     """Manages a WebVPN session with full IDP authentication."""
 
     def __init__(self):
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": config.USER_AGENT})
         self.logged_in = False
+
+        # Mount an HTTPAdapter with Retry so every request through this
+        # session (both login steps and iCourse API calls) automatically
+        # retries on transient network failures or 5xx rate-limit pages
+        # that WebVPN occasionally returns during recovery.
+        retry = Retry(
+            total=3,
+            backoff_factor=1.0,   # delays: 0s → 1s → 2s between retries
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "POST"],
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(
+            max_retries=retry, pool_connections=20, pool_maxsize=50,
+        )
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
 
     def login(self, student_id: str = None, password: str = None) -> bool:
         """Execute the full 7-step IDP authentication flow.

@@ -84,7 +84,9 @@ class Summarizer:
                 "Set at least one provider's API key (e.g. DASHSCOPE_API_KEY)."
             )
         self._clients = {
-            p["name"]: OpenAI(api_key=p["api_key"], base_url=p["base_url"])
+            p["name"]: OpenAI(
+                api_key=p["api_key"], base_url=p["base_url"], max_retries=1
+            )
             for p in self.providers
         }
 

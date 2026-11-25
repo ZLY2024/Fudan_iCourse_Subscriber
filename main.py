@@ -13,6 +13,7 @@ AudioDownloader.  This file does only orchestration:
 Anything more interesting belongs in one of ``src/*`` modules.
 """
 
+import random
 import time
 import traceback
 
@@ -31,13 +32,12 @@ from src.api.webvpn import SecondFactorError, WebVPNSession
 def login_with_retry(max_attempts: int = 10) -> WebVPNSession:
     """Login to WebVPN + iCourse CAS, retrying on transient failures.
 
-    The iCourse CAS step (authenticate_icourse) has its own inner retry
-    loop for transient redirect-chain hiccups; this outer loop only runs
-    when those inner retries are exhausted, which generally means the
-    WebVPN session itself needs a fresh login.  5 attempts handles the
-    long tail of times when CAS rejects multiple fresh sessions in a
-    row before letting one through.
+    Uses exponential backoff with jitter so repeated failures don't all hit
+    the server at the same second — especially important when WebVPN is
+    rate-limiting or recovering from a flap.  Wait times: 5s, 10s, 20s,
+    40s, 60s (capped), each ±30% jitter.
     """
+    base_delays = [5, 10, 20, 40, 60, 60, 60, 60, 60]  # index = attempt - 1
     for attempt in range(max_attempts):
         try:
             vpn = WebVPNSession()
@@ -50,9 +50,14 @@ def login_with_retry(max_attempts: int = 10) -> WebVPNSession:
             vpn.session.close()
             raise
         except Exception as e:
+            delay = base_delays[min(attempt, len(base_delays) - 1)]
+            jitter = random.uniform(delay * 0.7, delay * 1.3)
             if attempt < max_attempts - 1:
-                print(f"  Failed: {type(e).__name__}: {e}; retrying...")
-                time.sleep(5)
+                print(
+                    f"  Failed: {type(e).__name__}: {e}; "
+                    f"retrying in {jitter:.0f}s..."
+                )
+                time.sleep(jitter)
             else:
                 raise
 
